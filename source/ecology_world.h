@@ -5,14 +5,17 @@
 #include "tools/set_utils.h"
 #include "Evo/World.h"
 #include "Evo/Resource.h"
-#include "hardware/AvidaGP.h"
+//#include "hardware/AvidaGP.h"
 #include "TestcaseSet.h"
+#include "SetTestcases.h"
+#include "AvidaGP-Othello.h"
 #include "data/DataNode.h"
 #include "control/Signal.h"
 #include "tools/map_utils.h"
 #include "tools/memo_function.h"
 #include <map>
 #include <unordered_map>
+
 
 // #include "cec2013.h"
 
@@ -92,6 +95,9 @@ template <typename ORG_TYPE>
 class EcologyWorld : public emp::World<ORG_TYPE>{
 public:
 
+    using input_t = emp::array<int, 64>;
+    using output_t = std::set<int>;
+
     using typename emp::World<ORG_TYPE>::genotype_t;
     using typename emp::World<ORG_TYPE>::genome_t;
     using typename emp::World<ORG_TYPE>::fun_calc_fitness_t;
@@ -134,6 +140,10 @@ public:
     double FRAC;
     double MAX_RES_USE;
     TestcaseSet<int, double> testcases;
+    testcase_fun::TestcaseSet<64> othello_testcases;
+    emp::vector<std::pair<input_t, output_t>> tests;
+    emp::vector<int> scores;
+    emp::vector<emp::vector<output_t>> correct_choices;
     std::set<size_t> full_set;
     int failed = 0;
     std::string PROBLEM;
@@ -162,6 +172,99 @@ public:
     //     on_elite_select.Trigger(repro_id);
     // }
 
+    // Fitness function that encourages playing in corners TODO Move these to their own file?
+    std::function<std::set<int>(emp::array<int, 64>)> cornerFunc = [](emp::array<int, 64> board) {
+        std::set<int> correct_moves;
+        emp::Othello game(BOARD_SIZE, 1);
+        game.SetBoard(board);
+        emp::vector<size_t> moves = game.GetMoveOptions(1);
+
+        for (size_t move : moves)
+        {
+            if (move == 0 || move == 7 || move == 56 || move == 63)
+                correct_moves.insert(move);
+        }
+        return correct_moves;
+    };
+
+    // Fitness function that encourages playing on edges
+    std::function<std::set<int>(emp::array<int, 64>)> edgeFunc = [](emp::array<int, 64> board) {
+        std::set<int> correct_moves;
+        emp::Othello game(BOARD_SIZE, 1);
+        game.SetBoard(board);
+        emp::vector<size_t> moves = game.GetMoveOptions(1);
+
+        for (size_t move : moves)
+        {
+            if (move % 8 == 0 || move % 8 == 7 || move >= 56 || move <= 7)
+                correct_moves.insert(move);
+        }
+        return correct_moves;
+    };
+
+    // Fitness function that encourages player to take move that captures the most tiles
+    std::function<std::set<int>(emp::array<int, 64>)> tilesTakenFunc = [](emp::array<int, 64> board) {
+        emp::Othello game(BOARD_SIZE, 1);
+        game.SetBoard(board);
+
+        std::set<int> correct_moves;
+        size_t player = 1;
+        int max_score = game.GetScore(player);
+        emp::vector<size_t> moves = game.GetMoveOptions(1);
+        int best_move = 0;
+
+        for (size_t move : moves)
+        {
+            game.DoMove(player, move);
+
+            if (game.GetScore(1) > max_score)
+            {
+                max_score = game.GetScore(1);
+                best_move = move;
+                correct_moves.clear();
+            }
+            else if (game.GetScore(1) == max_score)
+            {
+                correct_moves.insert(move);
+            }
+
+            game.SetBoard(board);
+        }
+
+        correct_moves.insert(best_move);
+        return correct_moves;
+    };
+
+    // Fitness function that encourages player to limit opponent moves
+    std::function<std::set<int>(emp::array<int, 64>)> EnemyMovesFunc = [](emp::array<int, 64> board) {
+        emp::Othello game(BOARD_SIZE, 1);
+        game.SetBoard(board);
+
+        size_t player = 1;
+        std::set<int> correct_moves;
+        emp::vector<size_t> moves = game.GetMoveOptions(1);
+        int min_score = game.GetMoveOptions(2).size();
+        int best_move = moves[0];
+
+        for (size_t move : moves)
+        {
+            game.DoMove(player, move);
+
+            if (game.GetMoveOptions(2).size() < min_score)
+            {
+                min_score = game.GetMoveOptions(2).size();
+                correct_moves.clear();
+                correct_moves.insert(move);
+            }
+            else if (game.GetMoveOptions(2).size() == min_score)
+            {
+                correct_moves.insert(move);
+            }
+
+            game.SetBoard(board);
+        }
+        return correct_moves;
+    };
 
     emp::DataNode<size_t, emp::data::Range> niche_width;
     emp::DataNode<size_t, emp::data::Range> sometimes_used;
@@ -171,7 +274,7 @@ public:
 
 
     EcologyWorld() {}
-    EcologyWorld(emp::Random & rnd) : emp::World<ORG_TYPE>(rnd) {}
+    EcologyWorld(emp::Random & rnd) : emp::World<ORG_TYPE>(rnd), othello_testcases("testcases/game_0.csv", rnd) {}
     ~EcologyWorld() {destructed = true;};
 
 
@@ -243,7 +346,12 @@ public:
         SetCache(true);
 
         InitConfigs(config);
-
+        othello_testcases.AddGroup(cornerFunc);
+        othello_testcases.AddGroup(edgeFunc);
+        othello_testcases.AddGroup(tilesTakenFunc);
+        othello_testcases.AddGroup(EnemyMovesFunc);
+        tests = othello_testcases.GetTestcases();
+        correct_choices = othello_testcases.GetCorrectChoices();
         SetupFitnessFunctions();
 
         for (size_t i = 0; i < N_TEST_CASES; i++) {
@@ -272,6 +380,7 @@ public:
 
                 genome_info gen;
                 ORG_TYPE cpu = org->GetInfo();
+                InitializeOthelloFuncs(cpu);
                 for (auto fit_fun : fit_set) {
                     gen.error_vec.push_back(fit_fun(cpu));
                 }
@@ -343,6 +452,38 @@ public:
 
     }
 
+    void InitializeOthelloFuncs(emp::AvidaGP & org){
+
+        for (int i = 0; i < correct_choices.size(); i++)
+        {
+            scores.push_back(0);
+        }
+
+        emp::vector<size_t> choices = othello_testcases.GetValidSubset();
+
+        emp::Othello game(BOARD_SIZE, 1); //TOD O: should it be random player first?
+
+        for (size_t choice : choices)
+        {
+            game.SetBoard(tests[choice].first);
+            int move = EvalMove(game, org);
+
+            for (int i = 0; i < correct_choices.size(); i++)
+            { //TODO: Make this into a function?
+                if (correct_choices[i][choice].find(move) != correct_choices[i][choice].end())
+                {
+                    scores[i]++;
+                }
+            }
+        }
+
+        for (int i = 0; i < correct_choices.size(); i++)
+        {
+            org.SetTrait(i, scores[i]);
+        }
+        
+    }
+
     void RunStep() {
         niche_width.Reset();
         always_used.Reset();
@@ -387,6 +528,7 @@ public:
             always_used.Add(per_genotype_data[GetGenome(*org)].always_used.size());
             sometimes_used.Add(per_genotype_data[GetGenome(*org)].sometimes_used.size());
         }
+
 
         for (auto tax : systematics.GetActive() ) {
             evolutionary_distinctiveness.Add(systematics.GetEvolutionaryDistinctiveness(tax, update));
@@ -510,6 +652,7 @@ void EcologyWorld<emp::AvidaGP>::SetupMutationFunctions() {
                 org.RandomizeInst(pos, *random_ptr);
             }
         }
+        InitializeOthelloFuncs(org);
 
     });
 }
@@ -560,6 +703,10 @@ void EcologyWorld<emp::AvidaGP>::InitPop() {
         emp::AvidaGP cpu;
         cpu.PushRandom(random, GENOME_SIZE);
         Inject(cpu.GetGenome());
+    }
+    for (size_t i = 0; i < START_POP_SIZE; i++)
+    {
+        InitializeOthelloFuncs(*pop[i]);
     }
 }
 
@@ -650,56 +797,93 @@ void EcologyWorld<emp::vector<double> >::SetupFitnessFunctions() {
 
 template <>
 void EcologyWorld<emp::AvidaGP>::SetupFitnessFunctions() {
-
-    testcases.LoadTestcases(PROBLEM);
     fit_set.resize(0);
+    std::function<double(emp::AvidaGP &)> goal_function;
 
-    int count = 0;
-    for (auto testcase : testcases.GetTestcases()) {
-        fit_set.push_back([testcase, count, this](emp::AvidaGP & org){
+        if (PROBLEM == "othello")
+    {
 
-            if (emp::Has(per_genotype_data, org.GetGenome()) && ((uint32_t)(per_genotype_data[org.GetGenome()].error_vec.size()) == N_TEST_CASES)) {
-                return per_genotype_data[org.GetGenome()].error_vec[count];
+        goal_function = [this](emp::AvidaGP &org) {
+            emp::vector<double> fit_list;
+            //Take the median of 3 games as the organisms fitness
+            for (int i = 0; i < 3; i++)
+            {
+                int first_player = random_ptr->GetInt(1, 3);
+                bool rand_player = 1;
+                emp::AvidaGP &rand_org1 = GetRandomOrg();
+
+                if (i > 2)
+                    rand_player = 1;
+
+                fit_list.push_back(EvalGame(*random_ptr, org, rand_org1, first_player, false, rand_player));
             }
+            std::sort(fit_list.begin(), fit_list.end());
+            return fit_list[1]; // Return the median
+        };
 
-            org.ResetHardware();
-            for (size_t i = 0; i < testcase.first.size(); i++) {
-                org.SetInput(i, testcase.first[i]);
-            }
-            org.SetOutput(0,-99999); // Otherwise not outputting anything is a decent strategy
-
-            org.Process(200);
-            int divisor = testcase.second;
-            if (divisor == 0) {
-                divisor = 1;
-            }   
-            double result = 1 - (std::abs(org.GetOutput(0) - testcase.second)/divisor);
-            // emp_assert(std::abs(result) != INFINITY);
-            if (result == -INFINITY) {
-                result = -999999999;
-            }
-            // per_genotype_data[org.GetGenome()].error_vec.push_back(result);
-            return result;
-        });
-
-        count++;
-        if (count >= (int)N_TEST_CASES) {
-            break;
+        for (size_t fun_id = 0; fun_id < othello_testcases.GetNFuncs(); fun_id++)
+        {
+            // Create list of secondary fitness functions.
+            fit_set.push_back([fun_id, this](emp::AvidaGP &org) {
+                if (org.traits.size() < fun_id) {
+                    InitializeOthelloFuncs(org);
+                }
+                return org.GetTrait(fun_id);
+            });
         }
     }
+    else{
+
+        testcases.LoadTestcases(PROBLEM);
+
+        int count = 0;
+        for (auto testcase : testcases.GetTestcases()) {
+            fit_set.push_back([testcase, count, this](emp::AvidaGP & org){
+
+                if (emp::Has(per_genotype_data, org.GetGenome()) && ((uint32_t)(per_genotype_data[org.GetGenome()].error_vec.size()) == N_TEST_CASES)) {
+                    return per_genotype_data[org.GetGenome()].error_vec[count];
+                }
+
+                org.ResetHardware();
+                for (size_t i = 0; i < testcase.first.size(); i++) {
+                    org.SetInput(i, testcase.first[i]);
+                }
+                org.SetOutput(0,-99999); // Otherwise not outputting anything is a decent strategy
+
+                org.Process(200);
+                int divisor = testcase.second;
+                if (divisor == 0) {
+                    divisor = 1;
+                }   
+                double result = 1 - (std::abs(org.GetOutput(0) - testcase.second)/divisor);
+                // emp_assert(std::abs(result) != INFINITY);
+                if (result == -INFINITY) {
+                    result = -999999999;
+                }
+                // per_genotype_data[org.GetGenome()].error_vec.push_back(result);
+                return result;
+            });
+
+            count++;
+            if (count >= (int)N_TEST_CASES) {
+                break;
+            }
+        }
 
 
-    std::function<double(const emp::AvidaGP&)> goal_function = [this](const emp::AvidaGP & org){
+        goal_function = [this](emp::AvidaGP & org){
 
-        // double total = 0;
-        // for (double val : per_genotype_data[org.GetGenome()].error_vec) {
-        //     total += val;
-        // }
+            // double total = 0;
+            // for (double val : per_genotype_data[org.GetGenome()].error_vec) {
+            //     total += val;
+            // }
 
-        // return total;
-        return per_genotype_data[org.GetGenome()].fit;
+            // return total;
+            return per_genotype_data[org.GetGenome()].fit;
 
-    };
+        };
+
+    }
 
     fun_calc_dist_t dist_fun = [this](emp::AvidaGP & org1, emp::AvidaGP & org2) {
         double dist = 0;
